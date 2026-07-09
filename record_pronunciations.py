@@ -56,7 +56,10 @@ TTS_GAP_SEC       = 0.4         # gap between the two teach playbacks
 FACE_COVERAGE_MIN = 0.9         # take needs >= 90% face-found frames
 CALIB_FACE_MIN    = 0.5         # calibration take is redone below this coverage
 MOVEMENT_SCALE    = 2.5         # movement_threshold = idle_energy * scale ...
-MOVEMENT_FLOOR    = 1.5         # ... but never below this floor
+MOVEMENT_FLOOR    = 0.4         # ... but never below this floor. Only guards
+                                # idle~0; on low-contrast webcams real lip
+                                # motion can measure ~1.0, so a high floor
+                                # rejects every take. Tune with --movement-scale.
 BRIGHT_RANGE      = (60, 200)   # acceptable mean grayscale brightness
 FAIL_RETRY_LIMIT  = 3           # auto-retries before the R/A/S choice screen
 FAIL_MSG_SEC      = 1.5
@@ -139,6 +142,10 @@ def main():
                         help='takes to record per item')
     parser.add_argument('--seconds', type=float, default=RECORD_SECONDS,
                         help='length of one take in seconds')
+    parser.add_argument('--movement-scale', type=float, default=MOVEMENT_SCALE,
+                        help='lip-movement gate = idle_energy * this scale; '
+                             'lower it (e.g. 1.5) if takes keep failing with '
+                             '"not enough lip movement"')
     parser.add_argument('--extended', action='store_true',
                         help='include the 8 extended curriculum items')
     parser.add_argument('--redo', metavar='ITEM_ID',
@@ -200,7 +207,15 @@ def main():
 
     calib = session['calibration']
     need_calib = args.recalibrate or calib is None
-    movement_threshold = (calib or {}).get('movement_threshold', MOVEMENT_FLOOR)
+    movement_threshold = MOVEMENT_FLOOR
+    if calib:
+        # recompute from the stored idle energy so --movement-scale takes
+        # effect without redoing calibration; persist it for the realtime app
+        movement_threshold = max(
+            calib.get('idle_energy', 0.0) * args.movement_scale, MOVEMENT_FLOOR)
+        if abs(movement_threshold - calib.get('movement_threshold', -1)) > 1e-9:
+            calib['movement_threshold'] = movement_threshold
+            save_session(session)
 
     # ── state machine context ─────────────────────────────────────────────────
     state       = ''        # calib_intro/countdown/record/teach/message/choice/pause/end
@@ -230,6 +245,7 @@ def main():
     calib_B     = []        # frame brightness samples during calibration
     last_roi    = None
     face_ok     = False
+    live_E      = 0.0       # rolling movement energy shown while recording
 
     def is_complete(it):
         return len(session['completed'].get(it['id'], [])) >= args.takes
@@ -251,8 +267,8 @@ def main():
         state = 'countdown'
 
     def start_record(mode):
-        nonlocal state, frames, misses, rec_mode
-        frames, misses, rec_mode = [], 0, mode
+        nonlocal state, frames, misses, rec_mode, live_E
+        frames, misses, rec_mode, live_E = [], 0, mode, 0.0
         state = 'record'
 
     def begin_item_take():
@@ -314,7 +330,7 @@ def main():
                          0.8, lambda: start_record('calib'))
             return
         idle = float(np.mean(calib_E))
-        movement_threshold = max(idle * MOVEMENT_SCALE, MOVEMENT_FLOOR)
+        movement_threshold = max(idle * args.movement_scale, MOVEMENT_FLOOR)
         bright = float(np.mean(calib_B)) if calib_B else 0.0
         session['calibration'] = {'idle_energy': idle,
                                   'movement_threshold': movement_threshold,
@@ -360,15 +376,25 @@ def main():
         # true face coverage: found frames over all sampled frames (a full-length
         # take with many misses must NOT read as 100%)
         cov = len(frames) / max(1, len(frames) + misses)
-        e = movement_energy(frames)
+        # peak rolling energy, not whole-take mean: a syllable moves the lips
+        # for ~0.5s of the 2s take, so the lead-in stillness would dilute the
+        # mean ~4x and reject clearly-articulated silent takes
+        e = max((movement_energy(frames[i:i + 6])
+                 for i in range(0, max(1, len(frames) - 5), 3)), default=0.0)
         if len(frames) < n_target or cov < FACE_COVERAGE_MIN:
             reason = [('面部丢失过多 face lost too often', 32, RED),
                       (f'采到 {len(frames)}/{n_target} 帧，检出率 {cov * 100:.0f}% '
                        f'({len(frames)}/{n_target} frames, '
                        f'{cov * 100:.0f}% face found)', 24, RED)]
         elif e < movement_threshold:
-            reason = [('嘴唇几乎没动，请出声读', 32, RED),
-                      ('lips barely moved - please speak the syllable aloud', 24, RED)]
+            # voice is NOT needed - the model only sees video; silent
+            # articulation is fine as long as the lips move clearly
+            reason = [('嘴唇动作不足（无需出声）', 32, RED),
+                      ('not enough lip movement - no voice needed,', 24, RED),
+                      ('just move your lips clearly', 24, RED),
+                      (f'动作强度 movement {e:.2f} < 阈值 threshold '
+                       f'{movement_threshold:.2f}', 22, ORANGE),
+                      ('阈值可调 tune with --movement-scale', 20, GRAY)]
         else:
             do_save_take(list(frames), e, cov)
             return
@@ -441,6 +467,8 @@ def main():
             if state == 'record':
                 if last_roi is not None:
                     frames.append(last_roi)
+                    if len(frames) >= 2:
+                        live_E = movement_energy(frames[-6:])
                 else:
                     misses += 1                    # no-face frame: count, don't append
                 if rec_mode == 'calib':
@@ -517,6 +545,13 @@ def main():
             put_text(disp, label, (42, TOPBAR_H + 14), 24, RED)
             put_text(disp, '面部正常 Face OK' if face_ok else '未检测到面部 No face',
                      (20, h - 80), 24, GREEN if face_ok else RED)
+            if rec_mode == 'item':
+                # live movement meter: green once the take clears the gate
+                meter_ok = live_E >= movement_threshold
+                put_text(disp,
+                         f'动作 movement {live_E:.2f} / {movement_threshold:.2f}'
+                         + ('  OK' if meter_ok else ''),
+                         (20, h - 110), 22, GREEN if meter_ok else ORANGE)
             draw_record_progress(disp, len(frames) / n_target)
 
         elif state == 'message':

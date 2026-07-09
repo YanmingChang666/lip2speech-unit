@@ -1,0 +1,18 @@
+# python
+__pycache__/
+*.pyc
+
+# model weights (56MB+ each - download links are in README.md;
+# use git-lfs if you really want them in the repo)
+checkpoints/*.pt
+
+# nested git clone (install per README: git clone fairseq && checkout afc77bd)
+fairseq/
+
+# run outputs / logs
+results/
+.hydra/
+*.log
+
+# personal recording data + TTS cache (contains your face-derived clips)
+datasets/pronunciation/

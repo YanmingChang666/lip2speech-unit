@@ -49,10 +49,15 @@ import cv2
 # ── config ────────────────────────────────────────────────────────────────────
 ENERGY_WINDOW   = 5         # sampled ROI frames per movement-energy estimate
 PREROLL_FRAMES  = 5         # frames kept before the detected segment start
-RISE_FRAMES     = 3         # consecutive frames above thr to start a segment
+RISE_FRAMES     = 2         # consecutive frames above thr to start a segment
 FALL_FRAMES     = 8         # consecutive frames below thr*FALL_RATIO to end one
 FALL_RATIO      = 0.7       # end-of-segment threshold = thr * FALL_RATIO
-DEFAULT_THRESHOLD = 2.0     # movement threshold when session has no calibration
+REALTIME_SCALE  = 1.8       # thr = idle_energy * this. Gentler than the
+                            # recorder quality gate (2.5): starting a segment
+                            # needs the bar crossed on consecutive LIVE frames,
+                            # not once per whole take
+MOVEMENT_FLOOR  = 0.4       # thr never below this
+DEFAULT_THRESHOLD = 1.0     # only used when session.json has no calibration
 
 HIGHLIGHT_S     = 1.5       # bright hanzi+pinyin display time after a hit
 UNKNOWN_SHOW_S  = 1.0       # gray "?" display time after a rejected segment
@@ -75,14 +80,23 @@ def resolve_device(choice):
 
 
 def movement_threshold_from_session(scale):
-    """Personal movement threshold = session calibration * scale (fallback 2.0)."""
+    """
+    Segmentation threshold derived from the calibrated IDLE energy:
+        thr = max(idle_energy * REALTIME_SCALE, MOVEMENT_FLOOR) * scale
+    Deliberately NOT the recorder's stored movement_threshold (a quality gate
+    checked once per take against the PEAK energy) - the live start trigger
+    must be crossed on consecutive frames, so it needs a lower bar.
+    """
     calib = load_session().get('calibration')
-    if isinstance(calib, dict):        # tolerate a dict-shaped calibration entry
-        calib = calib.get('movement_threshold', calib.get('idle_energy'))
+    idle = None
+    if isinstance(calib, dict):
+        idle = calib.get('idle_energy')
+        if idle is None and calib.get('movement_threshold') is not None:
+            idle = float(calib['movement_threshold']) / 2.5   # legacy session
     try:
-        thr = float(calib) * scale
+        thr = max(float(idle) * REALTIME_SCALE, MOVEMENT_FLOOR) * scale
         print(f"Movement threshold: {thr:.2f} "
-              f"(calibration {float(calib):.2f} x scale {scale:g})")
+              f"(idle {float(idle):.2f} x {REALTIME_SCALE:g} x scale {scale:g})")
         return thr
     except (TypeError, ValueError):
         thr = DEFAULT_THRESHOLD * scale
@@ -260,6 +274,8 @@ def main():
     last_roi = None
     webcam_frame_cnt = 0
     infer_thread = None
+    near_miss = 0            # sampled IDLE frames with movement just below thr
+    hint_printed = False
 
     while True:
         ret, frame = cap.read()
@@ -299,10 +315,22 @@ def main():
                         rise_cnt += 1
                     else:
                         rise_cnt = 0
+                    # movement that stays just under the bar -> show a hint
+                    if thr * 0.5 < last_energy <= thr:
+                        near_miss = min(near_miss + 1, 200)
+                        if near_miss == 25 and not hint_printed:
+                            hint_printed = True
+                            print("[hint] Lips are moving but stay below the "
+                                  "segmentation threshold - try: "
+                                  "python realtime_pronunciation.py "
+                                  "--threshold-scale 0.7")
+                    elif last_energy > thr:
+                        near_miss = 0
                     if rise_cnt >= RISE_FRAMES:
                         state = RECORDING
                         segment = list(preroll)
                         rise_cnt, fall_cnt = 0, 0
+                        near_miss = 0
                 else:
                     preroll.clear()
                     rise_cnt = 0
@@ -389,10 +417,17 @@ def main():
             state_txt, state_color = '等待说话 waiting', (200, 200, 200)
         put_text(disp, state_txt, (10, h - 40), px=26, color_bgr=state_color)
 
-        # debug: movement energy + top-3 probability bars
+        # movement meter (always on): green while above the trigger threshold
+        put_text(disp, f'动作 E {last_energy:.2f} / 阈值 thr {thr:.2f}',
+                 (10, h - 72), px=20,
+                 color_bgr=(0, 255, 0) if last_energy > thr else (180, 180, 180))
+        if near_miss >= 25 and state == IDLE:
+            put_text(disp, '嘴唇在动但低于阈值 movement below threshold - '
+                           'try --threshold-scale 0.7',
+                     (10, h - 100), px=20, color_bgr=(0, 165, 255))
+
+        # debug: top-3 probability bars
         if args.debug:
-            put_text(disp, f'E={last_energy:.2f} thr={thr:.2f}',
-                     (10, h - 72), px=20, color_bgr=(180, 180, 180))
             if snap['top3'] is not None:
                 y0 = h - 172
                 for i, (lbl, p) in enumerate(snap['top3']):
